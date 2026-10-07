@@ -153,7 +153,7 @@ final class FaceAuthManager: ObservableObject {
         frameCount = 0
         authStartTime = Date()
         state = .scanning
-        statusMessage = "Looking for your face…"
+        statusMessage = "Looking for your face"
         warningMessage = ""
         isFaceOffCenter = false
         isFaceDetected = false
@@ -218,7 +218,7 @@ final class FaceAuthManager: ObservableObject {
                         self.isFaceOffCenter = true
                         self.isFaceDetected = true
                     } else if observations.isEmpty {
-                        self.statusMessage = "Looking for your face…"
+                        self.statusMessage = "Looking for your face"
                         self.warningMessage = ""
                         self.isFaceOffCenter = false
                         self.isFaceDetected = false
@@ -255,7 +255,7 @@ final class FaceAuthManager: ObservableObject {
 
             guard result.isMatch else {
                 DispatchQueue.main.async {
-                    self.statusMessage = "Looking for your face…"
+                    self.statusMessage = "Looking for your face"
                 }
                 return
             }

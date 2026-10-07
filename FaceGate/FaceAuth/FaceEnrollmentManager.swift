@@ -27,6 +27,7 @@ final class FaceEnrollmentManager: ObservableObject {
     private var collectedEmbeddings: [[Float]] = []
     private var totalQuality: Float = 0
     private var framesSinceLastCapture: Int = 0
+    private var sessionEnrolledFaceID: UUID?
 
     /// Minimum frames to skip between captures (gives user time to shift expression).
     private let captureInterval = 15
@@ -71,7 +72,6 @@ final class FaceEnrollmentManager: ObservableObject {
 
     /// Start the enrollment process: activate camera and begin capturing face frames.
     func startEnrollment() {
-        guard state != .success else { return }
         collectedEmbeddings = []
         totalQuality = 0
         capturedCount = 0
@@ -127,11 +127,11 @@ final class FaceEnrollmentManager: ObservableObject {
                         self.isFaceOffCenter = true
                         self.isFaceDetected = true
                     } else if results.isEmpty {
-                        self.warningMessage = "No face detected — look at the camera"
+                        self.warningMessage = "No face detected - look at the camera"
                         self.isFaceOffCenter = false
                         self.isFaceDetected = false
                     } else {
-                        self.warningMessage = "Multiple faces detected — only one face allowed"
+                        self.warningMessage = "Multiple faces detected - only one face allowed"
                         self.isFaceOffCenter = false
                         self.isFaceDetected = true
                     }
@@ -151,7 +151,7 @@ final class FaceEnrollmentManager: ObservableObject {
             // Reject low-quality captures.
             guard quality >= FGConstants.minimumCaptureQuality else {
                 DispatchQueue.main.async {
-                    self.warningMessage = "Poor lighting or angle — adjust position"
+                    self.warningMessage = "Poor lighting or angle - adjust position"
                 }
                 return
             }
@@ -206,45 +206,66 @@ final class FaceEnrollmentManager: ObservableObject {
 
     private func finishEnrollment() {
         state = .processing
-        statusMessage = "Processing face data…"
+        statusMessage = "Processing face data"
         cameraManager.onFrameCaptured = nil
         cameraManager.stopCapture()
 
         let averageQuality = totalQuality / Float(collectedEmbeddings.count)
 
-        do {
-            if isAddingFace {
-                var enrollment = dataStore.load() ?? FaceEnrollment(faces: [])
-                let nextFaceNumber = enrollment.faces.count + 1
-                let newFace = FaceEnrollment.EnrolledFace(
-                    id: UUID(),
-                    name: "Face \(nextFaceNumber)",
-                    embeddings: collectedEmbeddings,
-                    enrolledDate: Date(),
-                    averageQuality: averageQuality
-                )
-                enrollment.faces.append(newFace)
-                try dataStore.save(enrollment)
-            } else {
-                let newFace = FaceEnrollment.EnrolledFace(
-                    id: UUID(),
-                    name: "Face 1",
-                    embeddings: collectedEmbeddings,
-                    enrolledDate: Date(),
-                    averageQuality: averageQuality
-                )
-                let enrollment = FaceEnrollment(faces: [newFace])
-                try dataStore.save(enrollment)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self else { return }
+            do {
+                if self.isAddingFace {
+                    var enrollment = self.dataStore.load() ?? FaceEnrollment(faces: [])
+                    
+                    if let existingID = self.sessionEnrolledFaceID,
+                       let index = enrollment.faces.firstIndex(where: { $0.id == existingID }) {
+                        // Replace the previously enrolled face in this session
+                        let updatedFace = FaceEnrollment.EnrolledFace(
+                            id: existingID,
+                            name: enrollment.faces[index].name,
+                            embeddings: self.collectedEmbeddings,
+                            enrolledDate: Date(),
+                            averageQuality: averageQuality
+                        )
+                        enrollment.faces[index] = updatedFace
+                    } else {
+                        // Brand new face for this session
+                        let newID = UUID()
+                        let nextFaceNumber = enrollment.faces.count + 1
+                        let newFace = FaceEnrollment.EnrolledFace(
+                            id: newID,
+                            name: "Face \(nextFaceNumber)",
+                            embeddings: self.collectedEmbeddings,
+                            enrolledDate: Date(),
+                            averageQuality: averageQuality
+                        )
+                        enrollment.faces.append(newFace)
+                        self.sessionEnrolledFaceID = newID
+                    }
+                    
+                    try self.dataStore.save(enrollment)
+                } else {
+                    let newFace = FaceEnrollment.EnrolledFace(
+                        id: UUID(),
+                        name: "Face 1",
+                        embeddings: self.collectedEmbeddings,
+                        enrolledDate: Date(),
+                        averageQuality: averageQuality
+                    )
+                    let enrollment = FaceEnrollment(faces: [newFace])
+                    try self.dataStore.save(enrollment)
+                }
+
+                UserDefaults.standard.set(true, forKey: FGConstants.faceEnrolledKey)
+                UserDefaults.standard.set(true, forKey: FGConstants.faceUnlockEnabledKey)
+
+                self.state = .success
+                self.statusMessage = "Face enrolled successfully!"
+            } catch {
+                self.state = .failed("Failed to save: \(error.localizedDescription)")
+                self.statusMessage = "Enrollment failed"
             }
-
-            // Enable face unlock by default after successful enrollment.
-            UserDefaults.standard.set(true, forKey: FGConstants.faceUnlockEnabledKey)
-
-            state = .success
-            statusMessage = "Face enrolled successfully!"
-        } catch {
-            state = .failed("Failed to save: \(error.localizedDescription)")
-            statusMessage = "Enrollment failed"
         }
     }
 }

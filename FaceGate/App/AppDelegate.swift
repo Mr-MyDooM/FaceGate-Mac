@@ -11,11 +11,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         AppDelegate.shared = self
     }
 
-    private var settingsWindow: NSWindow?
     private var setupWindow: NSWindow?
-    private var settingsChromeState: SettingsChromeState?
-    private var settingsSidebarToggleTarget: SettingsSidebarToggleTarget?
     private(set) var updaterController: SPUStandardUpdaterController?
+    
+    // MARK: - Menu Bar App State
+    private var statusItem: NSStatusItem?
+    private var menuBuilder: MenuBuilder?
+    private var classicPopover: NSPopover?
+    private var eventMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Initialize Sparkle updater for automatic updates.
@@ -32,8 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             AppLocker.shared.blockApp(bundleIdentifier: bundleId, runningApp: runningApp)
         }
 
-        // Initialize as accessory to let SwiftUI's MenuBarExtra initialize first.
+        // Initialize as accessory so we don't show in the Dock.
         NSApp.setActivationPolicy(.accessory)
+        
+        // Set up the custom menu bar item and popover panel
+        setupMenuBarItem()
 
         // Start monitoring BEFORE the blocking loadModel() call. Observers registered with
         // queue: .main will enqueue notifications during the block and deliver them once the
@@ -65,7 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(openSettingsWindow),
-            name: .openSettings,
+            name: Notification.Name.openSettings,
             object: nil
         )
 
@@ -73,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(openSetupWindow),
-            name: .openSetup,
+            name: Notification.Name.openSetup,
             object: nil
         )
 
@@ -97,12 +103,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             name: NSNotification.Name("com.apple.screenIsLocked"),
             object: nil
         )
+
+        // Intercept the default SwiftUI Settings shortcut (Cmd+,)
+        // so it opens our custom SettingsWindow instead of the default blank SwiftUI Settings scene.
+        DispatchQueue.main.async {
+            if let menu = NSApp.mainMenu {
+                for item in menu.items {
+                    if let submenu = item.submenu {
+                        for subitem in submenu.items {
+                            if subitem.keyEquivalent == "," {
+                                subitem.target = self
+                                subitem.action = #selector(self.openSettingsWindow)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     var isAuthorizedToQuit = false
 
     var isSettingsWindowVisible: Bool {
-        settingsWindow?.isVisible ?? false
+        NSApp.windows.contains { $0.title == "Settings" && $0.isVisible }
     }
 
 
@@ -151,6 +174,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Settings Window
 
     private func closeMenuBarWindow() {
+        statusItem?.menu?.cancelTracking()
+        
         for window in NSApp.windows {
             let className = String(describing: type(of: window))
             if className.contains("StatusItem") || className.contains("MenuWindow") || (window.title.isEmpty && window.isVisible && className.contains("Window")) {
@@ -159,14 +184,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    @MainActor
+    @objc private func showSettingsWindow() {
+        SettingsWindowController.show()
+    }
+
+    @MainActor
     @objc private func openSettingsWindow() {
         closeMenuBarWindow()
+
+        if SettingsWindowController.isVisible {
+            SettingsWindowController.show()
+            return
+        }
 
         if let blockedApp = AppLocker.shared.currentlyBlockedApp,
            NSWorkspace.shared.frontmostApplication?.bundleIdentifier == blockedApp {
             // Use pendingContinuation instead of ActionAuthWindow (which creates a 2nd LAContext).
-            AuthenticationManager.shared.pendingContinuation = { [weak self] in
-                self?.openSettingsWindowBypassingAuth()
+            AuthenticationManager.shared.pendingContinuation = {
+                Task { @MainActor in
+                    SettingsWindowController.show()
+                }
             }
             AppLocker.shared.bringOverlaysToFront()
             return
@@ -174,66 +212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             AppLocker.shared.handleSwitchAway()
         }
 
-        ActionAuthWindow.show(reason: "FaceGate Settings") { [weak self] in
-            self?.openSettingsWindowBypassingAuth()
+        ActionAuthWindow.show(reason: "FaceGate Settings") {
+            Task { @MainActor in
+                SettingsWindowController.show()
+            }
         }
-    }
-
-    private func openSettingsWindowBypassingAuth() {
-        if let existing = self.settingsWindow {
-            existing.orderFrontRegardless()
-            existing.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-            let chromeState = SettingsChromeState()
-            let settingsView = SettingsView(chromeState: chromeState)
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 920, height: 640),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-                backing: .buffered,
-                defer: false
-            )
-            window.title = "FaceGate Settings"
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
-            window.backgroundColor = .clear
-            window.isMovableByWindowBackground = true
-            window.minSize = NSSize(width: 850, height: 620)
-            window.contentView = NSHostingView(rootView: settingsView)
-            window.level = .floating
-            installSettingsSidebarToggle(on: window, chromeState: chromeState)
-            window.center()
-            window.delegate = self
-            window.isReleasedWhenClosed = false
-            
-            window.orderFrontRegardless()
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-
-            self.settingsChromeState = chromeState
-            self.settingsWindow = window
-    }
-
-    private func installSettingsSidebarToggle(on window: NSWindow, chromeState: SettingsChromeState) {
-        let button = NSButton(frame: NSRect(x: 0, y: 0, width: 30, height: 30))
-        button.image = NSImage(systemSymbolName: "sidebar.leading", accessibilityDescription: "Toggle sidebar")
-        button.imagePosition = .imageOnly
-        button.bezelStyle = .rounded
-        button.isBordered = true
-        button.focusRingType = .none
-        button.toolTip = "Toggle sidebar"
-
-        let target = SettingsSidebarToggleTarget(chromeState: chromeState)
-        button.target = target
-        button.action = #selector(SettingsSidebarToggleTarget.toggleSidebar)
-        settingsSidebarToggleTarget = target
-
-        let accessory = NSTitlebarAccessoryViewController()
-        accessory.view = button
-        accessory.layoutAttribute = .left
-        window.addTitlebarAccessoryViewController(accessory)
     }
 
     @objc private func openSetupWindow() {
@@ -265,28 +248,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                 }
                 // Open settings window
-                NotificationCenter.default.post(name: .openSettings, object: nil)
+                NotificationCenter.default.post(name: Notification.Name.openSettings, object: nil)
             }
         )
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 580),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "FaceGate Setup"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.isMovableByWindowBackground = false
         window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
         window.contentView = NSHostingView(rootView: setupView)
-        window.center()
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main {
+            let x = screen.frame.origin.x + (screen.frame.width - window.frame.width) / 2
+            let y = screen.frame.origin.y + (screen.frame.height - window.frame.height) / 2
+            window.setFrameOrigin(NSPoint(x: x, y: y))
+        }
         window.delegate = self
         window.isReleasedWhenClosed = false
+        window.delegate = self
         
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
         setupWindow = window
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window == setupWindow {
+            setupWindow = nil
+            // Optionally, post a notification to tell FaceEnrollmentView to explicitly cancel
+            NotificationCenter.default.post(name: NSNotification.Name("SetupWindowWillClose"), object: nil)
+        }
     }
 
     // MARK: - Sleep / Lock Handling
@@ -311,6 +319,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             print("[FaceGate] Failed to sync uninstall protection on launch: \(error)")
         }
     }
+    
+    // MARK: - Custom Menu Bar
+    
+    @MainActor
+    private func setupMenuBarItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem?.button {
+            let icon = NSImage(named: FGConstants.menuBarIcon)
+            icon?.isTemplate = true
+            button.image = icon
+            button.action = #selector(menuBarButtonClicked(_:))
+            button.target = self
+        }
+        
+        let builder = MenuBuilder()
+        self.menuBuilder = builder
+        
+        // Setup Popover for Classic Theme
+        let popover = NSPopover()
+        popover.contentSize = NSSize(width: 320, height: 420)
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(rootView: ClassicMenuBarView())
+        self.classicPopover = popover
+        
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            if let popover = self?.classicPopover, popover.isShown {
+                popover.performClose(event)
+            }
+        }
+    }
+    
+    @MainActor
+    @objc private func menuBarButtonClicked(_ sender: NSStatusBarButton) {
+        let themeRaw = UserDefaults.standard.string(forKey: FGConstants.appThemeKey) ?? AppTheme.classic.rawValue
+        let theme = AppTheme(rawValue: themeRaw) ?? .classic
+        
+        if theme == .classic {
+            if let popover = classicPopover {
+                if popover.isShown {
+                    popover.performClose(sender)
+                } else {
+                    popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+                    popover.contentViewController?.view.window?.makeKey()
+                }
+            }
+        } else {
+            if let menu = menuBuilder?.buildMenu() {
+                statusItem?.menu = menu
+                statusItem?.button?.performClick(nil)
+                statusItem?.menu = nil // Reset so we intercept next click
+            }
+        }
+    }
 }
 
 // MARK: - Sparkle Updater Delegate
@@ -328,33 +389,6 @@ extension AppDelegate: SPUUpdaterDelegate {
             alert.informativeText = "FaceGate's uninstall protection prevents the app bundle from being modified. To update, disable Uninstall Protection in Settings → Advanced, then check for updates again."
             alert.addButton(withTitle: "OK")
             alert.runModal()
-        }
-    }
-}
-
-private final class SettingsSidebarToggleTarget: NSObject {
-    private let chromeState: SettingsChromeState
-
-    init(chromeState: SettingsChromeState) {
-        self.chromeState = chromeState
-    }
-
-    @objc func toggleSidebar() {
-        chromeState.isSidebarCollapsed.toggle()
-    }
-}
-
-// MARK: - NSWindowDelegate
-
-extension AppDelegate {
-    func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        if window == settingsWindow {
-            settingsWindow = nil
-            settingsChromeState = nil
-            settingsSidebarToggleTarget = nil
-        } else if window == setupWindow {
-            setupWindow = nil
         }
     }
 }

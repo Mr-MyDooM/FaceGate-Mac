@@ -80,14 +80,14 @@ final class AppLocker: ObservableObject {
         sessionManager.createSession(for: bundleId)
         appMonitor.recordUnlock(for: bundleId)
 
-        // Dismiss overlays.
-        dismissOverlays()
-
-        // Unhide and activate the app.
+        // Unhide and activate the app BEFORE dismissing overlays to prevent macOS from falling back to the previous app (like Safari) and switching spaces.
         if let app = app {
             app.unhide()
             app.activate(options: [.activateIgnoringOtherApps])
         }
+
+        // Dismiss overlays.
+        dismissOverlays()
 
         action?()
         continuation?()

@@ -8,12 +8,13 @@ struct FaceEnrollmentView: View {
 
     /// Called when enrollment completes (success or skip).
     var onComplete: () -> Void
-
-    /// Whether this is shown in settings (allows cancel) vs onboarding (allows skip).
+    var onBack: (() -> Void)? = nil
     var isInSettings: Bool = false
 
     /// Whether this is adding a new face to an existing enrollment
     var isAddingFace: Bool = false
+    
+    static var hasEnrolledInThisSession = false
 
     @State private var cameraAuthorization: AVAuthorizationStatus = .notDetermined
 
@@ -24,7 +25,7 @@ struct FaceEnrollmentView: View {
         case .capturing:
             return "Follow the prompts on the camera screen"
         case .processing:
-            return "Processing face data…"
+            return "Processing face data"
         case .success:
             return "Face enrolled successfully!"
         case .failed(let message):
@@ -35,7 +36,7 @@ struct FaceEnrollmentView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Header.
-            VStack(spacing: 8) {
+            VStack(spacing: 4) {
                 Image(systemName: "faceid")
                     .font(.system(size: 32, weight: .light))
                     .foregroundStyle(
@@ -48,34 +49,32 @@ struct FaceEnrollmentView: View {
                     )
 
                 Text("Face Enrollment")
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .font(.title.bold())
 
                 Text(staticStatusMessage)
-                    .font(.system(size: 12))
+                    .font(.subheadline)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 300)
 
                 if !isAddingFace && !isInSettings {
                     Text("You can add up to 3 faces from Settings")
-                        .font(.system(size: 11))
+                        .font(.caption)
                         .foregroundColor(.blue.opacity(0.85))
                         .multilineTextAlignment(.center)
                         .padding(.top, 2)
                 }
             }
-            .padding(.top, 12)
-            .padding(.bottom, 4)
+            .padding(.bottom, 0)
 
             // Warning message (above the video screen)
             VStack(spacing: 2) {
                 Text(enrollmentManager.warningMessage)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.caption)
                     .foregroundColor(.red.opacity(0.8))
                     .multilineTextAlignment(.center)
-                    .frame(height: 20)
-
             }
+            .frame(height: 20)
             .animation(.easeInOut(duration: 0.25), value: enrollmentManager.warningMessage)
             .padding(.bottom, 6)
 
@@ -114,46 +113,66 @@ struct FaceEnrollmentView: View {
                     .strokeBorder(Color.white.opacity(0.1), lineWidth: 1)
             )
 
-            // Progress bar.
-            if enrollmentManager.state == .capturing {
-                VStack(spacing: 6) {
+            // Progress bar placeholder to prevent UI jumps.
+            VStack(spacing: 6) {
+                if enrollmentManager.state == .capturing {
                     ProgressView(
                         value: Double(enrollmentManager.capturedCount),
                         total: Double(enrollmentManager.targetFrameCount)
                     )
                     .progressViewStyle(.linear)
-                    .tint(Color(hue: 0.58, saturation: 0.6, brightness: 0.85))
+                    .tint(.accentColor)
 
                     Text("\(enrollmentManager.capturedCount) of \(enrollmentManager.targetFrameCount) captures")
-                        .font(.system(size: 11))
+                        .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                .padding(.horizontal, 40)
-                .padding(.top, 8)
             }
+            .frame(width: 320, height: 40)
+            .padding(.top, 8)
 
-            Spacer()
+            if !isInSettings {
+                Spacer()
+            } else {
+                Spacer().frame(height: 24)
+            }
 
             // Action buttons.
             actionButtons
-                .padding(.bottom, 16)
         }
-        .frame(width: 420, height: isInSettings ? 530 : 490)
+        .padding(.top, isInSettings ? 32 : 0)
+        .padding(.bottom, isInSettings ? 32 : 0)
+        .frame(width: isInSettings ? 460 : nil)
+        .frame(
+            maxWidth: isInSettings ? nil : .infinity,
+            maxHeight: isInSettings ? nil : .infinity
+        )
         .onAppear {
             enrollmentManager.isAddingFace = isAddingFace
-            checkCameraAndStart()
+            if FaceEnrollmentView.hasEnrolledInThisSession && !isInSettings {
+                enrollmentManager.state = .success
+            } else {
+                checkCameraAndStart()
+            }
         }
         .onDisappear {
-            // If the window is closed before enrollment finishes (e.g. user clicks
-            // the close button mid-capture), cancel enrollment so the camera stops
-            // and display brightness is restored to its original value.
-            if enrollmentManager.state == .capturing || enrollmentManager.state == .processing {
-                enrollmentManager.cancelEnrollment()
-            }
+            // Always cancel enrollment when disappearing
+            enrollmentManager.cancelEnrollment()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("SetupWindowWillClose"))) { _ in
+            // Handle the case where the user closes the setup window via the red traffic light button.
+            // AppKit window closing sometimes prevents SwiftUI onDisappear from firing immediately.
+            enrollmentManager.cancelEnrollment()
+            FaceEnrollmentView.hasEnrolledInThisSession = false
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             guard enrollmentManager.state == .idle else { return }
             checkCameraAndStart()
+        }
+        .onChange(of: enrollmentManager.state) { newState in
+            if newState == .success {
+                FaceEnrollmentView.hasEnrolledInThisSession = true
+            }
         }
     }
 
@@ -169,9 +188,13 @@ struct FaceEnrollmentView: View {
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak enrollmentManager] granted in
                 DispatchQueue.main.async {
-                    guard granted, let manager = enrollmentManager else { return }
-                    manager.camera.permissionGranted = true
-                    manager.startEnrollment()
+                    if granted {
+                        guard let manager = enrollmentManager else { return }
+                        manager.camera.permissionGranted = true
+                        manager.startEnrollment()
+                    } else {
+                        cameraAuthorization = .denied
+                    }
                 }
             }
         case .denied, .restricted:
@@ -190,26 +213,20 @@ struct FaceEnrollmentView: View {
                 .foregroundColor(.red.opacity(0.8))
 
             Text("Camera Access Denied")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.headline)
                 .foregroundColor(.white)
 
             Text("FaceGate needs camera access to enroll your face. Please enable it in System Settings.")
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .foregroundColor(.white.opacity(0.6))
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 24)
 
-            Button {
+            Button("Open System Settings") {
                 CameraManager.openSystemSettings()
-            } label: {
-                Text("Open System Settings")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Capsule().fill(Color.blue))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
         }
     }
 
@@ -219,9 +236,14 @@ struct FaceEnrollmentView: View {
         VStack(spacing: 12) {
             ProgressView()
                 .scaleEffect(1.5)
-            Text("Processing face data…")
-                .font(.system(size: 13))
+            Text("Face Captured!")
+                .font(.headline)
+                .foregroundColor(.white)
+            Text("Please allow Keychain access to securely store your data.")
+                .font(.subheadline)
                 .foregroundColor(.white.opacity(0.8))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 20)
         }
     }
 
@@ -231,11 +253,13 @@ struct FaceEnrollmentView: View {
                 .font(.system(size: 48))
                 .foregroundColor(.green)
             Text("Face Enrolled!")
-                .font(.system(size: 16, weight: .semibold))
+                .font(.headline)
                 .foregroundColor(.white)
-            Text("\(enrollmentManager.capturedCount) reference captures saved")
-                .font(.system(size: 12))
-                .foregroundColor(.white.opacity(0.6))
+            if enrollmentManager.capturedCount > 0 {
+                Text("\(enrollmentManager.capturedCount) reference captures saved")
+                    .font(.subheadline)
+                    .foregroundColor(.white.opacity(0.6))
+            }
         }
     }
 
@@ -245,10 +269,10 @@ struct FaceEnrollmentView: View {
                 .font(.system(size: 48))
                 .foregroundColor(.red)
             Text("Enrollment Failed")
-                .font(.system(size: 16, weight: .semibold))
+                .font(.headline)
                 .foregroundColor(.white)
             Text(message)
-                .font(.system(size: 12))
+                .font(.subheadline)
                 .foregroundColor(.white.opacity(0.6))
                 .multilineTextAlignment(.center)
         }
@@ -259,24 +283,27 @@ struct FaceEnrollmentView: View {
     @ViewBuilder
     private var actionButtons: some View {
         if cameraAuthorization == .denied || cameraAuthorization == .restricted {
-            secondaryButton(isInSettings ? "Cancel" : "Skip") {
-                onComplete()
+            VStack(spacing: 16) {
+                secondaryButton(isInSettings ? "Cancel" : "Skip") { onComplete() }
+                if let onBack = onBack { backButton(action: onBack) }
             }
         } else {
             switch enrollmentManager.state {
             case .idle:
-                secondaryButton(isInSettings ? "Cancel" : "Skip for Now") {
-                    onComplete()
+                VStack(spacing: 16) {
+                    secondaryButton(isInSettings ? "Cancel" : "Skip for Now") { onComplete() }
+                    if let onBack = onBack { backButton(action: onBack) }
                 }
 
             case .capturing:
                 VStack(spacing: 8) {
-                    primaryButton("Recapture") {
-                        enrollmentManager.startEnrollment()
-                    }
                     secondaryButton(isInSettings ? "Cancel" : "Skip for Now") {
                         enrollmentManager.cancelEnrollment()
                         onComplete()
+                    }
+                    HStack(spacing: 12) {
+                        if let onBack = onBack { backButton(action: onBack) }
+                        primaryButton("Recapture") { enrollmentManager.startEnrollment() }
                     }
                 }
 
@@ -284,17 +311,20 @@ struct FaceEnrollmentView: View {
                 EmptyView()
 
             case .success:
-                primaryButton("Continue") {
-                    onComplete()
+                VStack(spacing: 16) {
+                    secondaryButton("Re-enroll") { enrollmentManager.startEnrollment() }
+                    HStack(spacing: 12) {
+                        if let onBack = onBack { backButton(action: onBack) }
+                        primaryButton("Continue") { onComplete() }
+                    }
                 }
 
             case .failed:
-                VStack(spacing: 10) {
-                    primaryButton("Try Again") {
-                        enrollmentManager.startEnrollment()
-                    }
-                    secondaryButton(isInSettings ? "Cancel" : "Skip") {
-                        onComplete()
+                VStack(spacing: 16) {
+                    secondaryButton(isInSettings ? "Cancel" : "Skip") { onComplete() }
+                    HStack(spacing: 12) {
+                        if let onBack = onBack { backButton(action: onBack) }
+                        primaryButton("Try Again") { enrollmentManager.startEnrollment() }
                     }
                 }
             }
@@ -302,28 +332,26 @@ struct FaceEnrollmentView: View {
     }
 
     // MARK: - Button Styles
+    
+    private func backButton(action: @escaping () -> Void) -> some View {
+        Button("Back", action: action)
+            .controlSize(.large)
+            .frame(minWidth: 120)
+    }
 
     private func primaryButton(_ title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(.white)
-                .frame(width: 200, height: 38)
-                .background(
-                    Capsule()
-                        .fill(Color.blue)
-                )
-        }
-        .buttonStyle(.plain)
+        Button(title, action: action)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .frame(minWidth: 120)
     }
 
     private func secondaryButton(_ title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(.secondary)
-        }
-        .buttonStyle(.plain)
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .font(.subheadline)
+            .foregroundColor(.secondary)
+            .padding(.vertical, 8)
     }
 
     @ViewBuilder
